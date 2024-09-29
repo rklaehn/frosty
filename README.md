@@ -1,5 +1,8 @@
 # Experiment with FROST signatures for iroh, pkarr or nostr ed keypairs
 
+This is using the [frost-ed25519](https://docs.rs/frost-ed25519/latest/frost_ed25519/) crate, which implements [FROST: Flexible Round-Optimized
+Schnorr Threshold Signatures](https://eprint.iacr.org/2020/852.pdf)
+
 ## Splitting a keypair
 
 Split the keypair in ~/.iroh/keypair into subdirectories a, b, c
