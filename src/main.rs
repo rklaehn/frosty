@@ -31,6 +31,7 @@ struct Args {
 #[derive(Debug, clap::Parser)]
 enum Command {
     Split(SplitArgs),
+    ReSplit(ReSplitArgs),
     SignLocal(SignLocalArgs),
     Sign(SignArgs),
     Cosign(CosignArgs),
@@ -57,6 +58,19 @@ struct SignLocalArgs {
     message: String,
     #[clap(long)]
     key: PublicKey,
+}
+
+#[derive(Debug, clap::Parser)]
+struct ReSplitArgs {
+    directories: Vec<String>,
+    #[clap(long)]
+    key: PublicKey,
+    #[clap(long, default_value_t = 2)]
+    min_signers: u16,
+    #[clap(long, default_value_t = 3)]
+    max_signers: u16,
+    #[clap(long)]
+    target: PathBuf,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -110,6 +124,47 @@ fn split(args: SplitArgs) -> anyhow::Result<()> {
         let key_path = path.join(format!("{}.secret", iroh_key.public()));
         let secret_share_bytes = secret_share.serialize()?;
         std::fs::write(key_path, secret_share_bytes)?;
+    }
+    Ok(())
+}
+
+fn resplit(args: ReSplitArgs) -> anyhow::Result<()> {
+    if args.directories.len() < 2 {
+        anyhow::bail!("At least two directories are required");
+    }
+    let mut parts = Vec::new();
+    let key = args.key;
+    for part in args.directories.iter() {
+        let secret_share_path = PathBuf::from(part).join(format!("{}.secret", key));
+        let secret_share_bytes = std::fs::read(&secret_share_path)?;
+        let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
+        let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
+        let public_key_package_path = PathBuf::from(part).join(format!("{}.pub", key));
+        let public_key_package_bytes = std::fs::read(&public_key_package_path)?;
+        let public_key_package = PublicKeyPackage::deserialize(&public_key_package_bytes)?;
+        parts.push((key_package, public_key_package));
+    }
+    let key_packages = parts
+        .iter()
+        .map(|(key_package, _)| key_package.clone())
+        .collect::<Vec<_>>();
+    let secret = frost::keys::reconstruct(key_packages.as_slice())?;
+    let (parts, pubkey) = frost::keys::split(
+        &secret,
+        args.max_signers,
+        args.min_signers,
+        IdentifierList::Default,
+        &mut thread_rng(),
+    )?;
+    let public_key_package_bytes = pubkey.serialize()?;
+    for (i, (_, secret_share)) in parts.iter().enumerate() {
+        let secret_share_bytes = secret_share.serialize()?;
+        let dir = args.target.join(format!("{}", i));
+        std::fs::create_dir_all(&dir)?;
+        let secret_share_path = dir.join(format!("{}.secret", args.key));
+        std::fs::write(secret_share_path, secret_share_bytes)?;
+        let public_key_package_path = dir.join(format!("{}.pub", args.key));
+        std::fs::write(public_key_package_path, public_key_package_bytes.clone())?;
     }
     Ok(())
 }
@@ -371,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
         Command::Split(args) => split(args)?,
+        Command::ReSplit(args) => resplit(args)?,
         Command::SignLocal(args) => sign_local(args)?,
         Command::Cosign(args) => cosign_daemon(args).await?,
         Command::Sign(args) => sign(args).await?,
