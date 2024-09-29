@@ -23,10 +23,11 @@ Signature: daec0537cd6f080cce1ae7150684ac3147e576c9bde9a74d27e914bcfa834cef2d204
 
 ## Co-signing daemon
 
-Start with one of the directories created by split
+Start with one of the directories created by split. We created splits a, b and
+c in the previous example, so let's use a.
 
 ```
-> cargo run cosign --data-path path-to-fragments
+> cargo run cosign --data-path a
 
 Can cosign for following keys
 - 25mzjgjlrcrma7wkm4l3fjv2afcs53cvmmyw3v2uwwt2dczsinaa (min 2 signers)
@@ -43,7 +44,13 @@ for all possible co-signers.
 Each co-signer must have a different fragment, and the local fragment should also
 be different to all the fragments the co-signers are using.
 
+In this case we are using b locally and node 2wgtsap6bsur5ruzb6pxdindy6j2n4e5zyq34tz7n2kjmngter2a
+is using a remotely.
+
+In a real usage you would not have the three fragments on the same machine, since
+that defeats the purpose of the scheme.
+
 ```
-> cargo run sign --message test --data-path other-path-to-fragments --key 25mzjgjlrcrma7wkm4l3fjv2afcs53cvmmyw3v2uwwt2dczsinaa 2wgtsap6bsur5ruzb6pxdindy6j2n4e5zyq34tz7n2kjmngter2a
+> cargo run sign --message test --data-path b --key 25mzjgjlrcrma7wkm4l3fjv2afcs53cvmmyw3v2uwwt2dczsinaa 2wgtsap6bsur5ruzb6pxdindy6j2n4e5zyq34tz7n2kjmngter2a
 Signature: 8cfae38266ee55c274d865b352b94d19e701def117fbcafd4eefccde8eefa5a8382d43275bafe2da6c39e07fdd2b88a12a43c8b12126d17e3a7c2bf14590400f
 ```
