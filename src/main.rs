@@ -8,7 +8,7 @@ use frost_ed25519::{
 use iroh_net::key::PublicKey;
 use rand::thread_rng;
 use sha2::{Digest, Sha512};
-use std::{any, collections::BTreeMap, path::PathBuf, str::FromStr};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 
 #[derive(Debug, clap::Parser)]
 struct Args {
@@ -20,6 +20,7 @@ struct Args {
 enum Command {
     Split(SplitArgs),
     Sign(SignArgs),
+    Cosign(CosignArgs),
 }
 
 #[derive(Debug, clap::Parser)]
@@ -43,6 +44,13 @@ struct SignArgs {
     message: String,
     #[clap(long)]
     key: PublicKey,
+}
+
+#[derive(Debug, clap::Parser)]
+struct CosignArgs {
+    /// Optional path to the directory where the fragments are stored
+    #[clap(long)]
+    data_path: Option<PathBuf>,
 }
 
 fn split(args: SplitArgs) -> anyhow::Result<()> {
@@ -125,11 +133,106 @@ fn ed25519_secret_key_to_scalar(secret_key: &[u8; 32]) -> <Ed25519ScalarField as
     <Ed25519ScalarField as Field>::Scalar::from_bytes_mod_order(scalar_bytes)
 }
 
-fn main() -> anyhow::Result<()> {
+async fn handle_cosign_request(
+    incoming: iroh_net::endpoint::Incoming,
+    data_path: PathBuf,
+) -> anyhow::Result<()> {
+    let mut connecting = incoming.accept()?;
+    let alpn = connecting.alpn().await?;
+    let connection = connecting.await?;
+    let remote_node_id = iroh_net::endpoint::get_remote_node_id(&connection)?;
+    tracing::info!(
+        "Incoming connection from {} (ALPN {})",
+        remote_node_id,
+        std::str::from_utf8(&alpn)?
+    );
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    let mut key = [0u8; 32];
+    recv.read_exact(&mut key).await?;
+    let key = PublicKey::from_bytes(&key)?;
+    tracing::info!("Received request to co-sign for key {}", key);
+    let secret_share_path = data_path.join(format!("{}.secret", key));
+    let secret_share_bytes = std::fs::read(&secret_share_path)?;
+    let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
+    let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
+    tracing::info!("Got fragment, creating commitment");
+    let (nonces, commitments) =
+        frost::round1::commit(key_package.signing_share(), &mut thread_rng());
+    let commitments_bytes = commitments.serialize()?;
+    let commitments_bytes_len = commitments_bytes.len() as u32;
+    tracing::info!("Sending commitment");
+    send.write_all(&commitments_bytes_len.to_be_bytes()).await?;
+    send.write_all(&commitments_bytes).await?;
+    tracing::info!("Waiting for signing package");
+    let mut signing_package_len_bytes = [0u8; 4];
+    recv.read_exact(&mut signing_package_len_bytes).await?;
+    let mut signing_package_bytes =
+        vec![0u8; u32::from_be_bytes(signing_package_len_bytes) as usize];
+    recv.read_exact(&mut signing_package_bytes).await?;
+    let signing_package = frost::SigningPackage::deserialize(&signing_package_bytes)?;
+    tracing::info!("Received signing package, creating signature share");
+    let signature_share = frost::round2::sign(&signing_package, &nonces, &key_package)?;
+    let signature_share_bytes = signature_share.serialize();
+    tracing::info!("Sending signature share");
+    send.write_all(&signature_share_bytes).await?;
+    send.finish()?;
+    Ok(())
+}
+
+async fn cosign_daemon(args: CosignArgs) -> anyhow::Result<()> {
+    let data_path = args.data_path.unwrap_or_else(|| PathBuf::from("."));
+    let mut keys = Vec::new();
+    for entry in std::fs::read_dir(&data_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .extension()
+            .map(|ext| ext == "secret")
+            .unwrap_or_default()
+        {
+            if let Some(stem) = path.file_stem() {
+                if let Some(text) = stem.to_str() {
+                    let key = iroh_net::key::PublicKey::from_str(text)?;
+                    let secret_share_bytes = std::fs::read(&path)?;
+                    let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
+                    let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
+                    keys.push((key, key_package));
+                }
+            }
+        }
+    }
+    if !keys.is_empty() {
+        println!("Can cosign for following keys");
+        for (key, key_package) in keys.iter() {
+            println!("- {} (min {} signers)", key, key_package.min_signers());
+            println!("{:?}", key_package.identifier())
+        }
+    }
+    let endpoint = iroh_net::endpoint::Endpoint::builder()
+        .alpns(vec![b"FROST_COSIGN".to_vec()])
+        .bind()
+        .await?;
+    let addr = endpoint.node_addr().await?;
+    println!("Listening on {}", addr.node_id);
+    while let Some(incoming) = endpoint.accept().await {
+        let data_path = data_path.clone();
+        tokio::task::spawn(async {
+            if let Err(cause) = handle_cosign_request(incoming, data_path).await {
+                tracing::error!("Error handling cosign request: {:?}", cause);
+            }
+        });
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     match args.cmd {
         Command::Split(args) => split(args)?,
         Command::Sign(args) => sign(args)?,
+        Command::Cosign(args) => cosign_daemon(args).await?,
     }
     Ok(())
 }
@@ -173,10 +276,7 @@ fn example() -> anyhow::Result<()> {
         let key_package = &key_packages[&participant_identifier];
         // Generate one (1) nonce and one SigningCommitments instance for each
         // participant, up to _threshold_.
-        let (nonces, commitments) = frost::round1::commit(
-            key_package.signing_share(),
-            &mut rng,
-        );
+        let (nonces, commitments) = frost::round1::commit(key_package.signing_share(), &mut rng);
         // In practice, the nonces must be kept by the participant to use in the
         // next round, while the commitment must be sent to the coordinator
         // (or to every other participant if there is no coordinator) using
