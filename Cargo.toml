@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0.89"
 clap = { version = "4.5.18", features = ["derive"] }
 frost-ed25519 = "1.0.0"
+futures = "0.3.30"
 hex = "0.4.3"
 iroh-net = "0.25.0"
 pkarr = "2.2.0"

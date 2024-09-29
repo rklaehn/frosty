@@ -1024,6 +1024,7 @@ dependencies = [
  "anyhow",
  "clap",
  "frost-ed25519",
+ "futures",
  "hex",
  "iroh-net",
  "pkarr",
