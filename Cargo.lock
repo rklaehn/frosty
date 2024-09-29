@@ -1028,7 +1028,6 @@ dependencies = [
  "hex",
  "iroh-net",
  "pkarr",
- "postcard",
  "rand",
  "sha2",
  "tokio",

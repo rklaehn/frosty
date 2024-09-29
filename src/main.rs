@@ -5,6 +5,7 @@ use frost_ed25519::{
     keys::{IdentifierList, PublicKeyPackage, SecretShare},
     Ed25519ScalarField, Field, Identifier,
 };
+use futures::StreamExt;
 use iroh_net::{
     discovery::{dns::DnsDiscovery, pkarr::PkarrPublisher},
     endpoint::{RecvStream, SendStream},
@@ -12,7 +13,11 @@ use iroh_net::{
 };
 use rand::thread_rng;
 use sha2::{Digest, Sha512};
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 use tokio::io::AsyncWriteExt;
 
 const COSIGN_ALPN: &[u8] = b"FROST_COSIGN";
@@ -234,8 +239,9 @@ async fn send_cosign_request_round1(
 }
 
 async fn sign(args: SignArgs) -> anyhow::Result<()> {
-    let key = args.key;
     let data_path = args.data_path.unwrap_or_else(|| PathBuf::from("."));
+    let secret_key = get_or_create_key(&data_path.join("keypair"))?;
+    let key = args.key;
     let secret_share_path = data_path.join(format!("{}.secret", key));
     tracing::info!("Reading secret share from {}", secret_share_path.display());
     let secret_share_bytes = std::fs::read(&secret_share_path)?;
@@ -251,17 +257,32 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     tracing::info!("Creating local commitment");
     let (nonce, commitments) =
         frost::round1::commit(key_package.signing_share(), &mut thread_rng());
-    tracing::info!("{} co-signers required", key_package.min_signers() - 1);
+
+    let min_cosigners = key_package.min_signers() - 1;
+    tracing::info!("{} co-signers required", min_cosigners);
     let discovery = DnsDiscovery::n0_dns();
     let endpoint = iroh_net::endpoint::Endpoint::builder()
+        .secret_key(secret_key)
         .discovery(Box::new(discovery))
         .bind()
         .await?;
-    //
-    let mut cosigners = Vec::new();
-    for cosigner in args.cosigners.iter() {
-        cosigners.push(send_cosign_request_round1(&endpoint, &cosigner, &args.key).await?);
-    }
+    // get at least min_cosigners cosigners
+    // for each cosigner, we get send and recv streams, identifier and commitments
+    let cosigners = futures::stream::iter(args.cosigners.iter())
+        .map(|cosigner| send_cosign_request_round1(&endpoint, &cosigner, &args.key))
+        .buffer_unordered(10)
+        .filter_map(|res| async {
+            match res {
+                Ok(res) => Some(res),
+                Err(cause) => {
+                    tracing::warn!("Error sending cosign request: {:?}", cause);
+                    None
+                }
+            }
+        })
+        .take(min_cosigners as usize)
+        .collect::<Vec<_>>()
+        .await;
     let mut commitments_map = BTreeMap::new();
     for (_, _, identifier, commitments) in cosigners.iter() {
         commitments_map.insert(*identifier, commitments.clone());
@@ -287,7 +308,7 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     tracing::info!("got {} signature shares", signature_shares.len());
     let signature = frost::aggregate(&signing_package, &signature_shares, &public_key_package)?;
     let bytes = signature.serialize();
-    println!("{}", hex::encode(&bytes));
+    println!("Signature: {}", hex::encode(&bytes));
     let iroh_signature: iroh_net::key::Signature = bytes.into();
     if let Err(cause) = key.verify(args.message.as_bytes(), &iroh_signature) {
         tracing::error!("Verification failed: {:?}", cause);
@@ -297,7 +318,7 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
 
 async fn cosign_daemon(args: CosignArgs) -> anyhow::Result<()> {
     let data_path = args.data_path.unwrap_or_else(|| PathBuf::from("."));
-    let secret_key = SecretKey::generate();
+    let secret_key = get_or_create_key(&data_path.join("keypair"))?;
     let discovery = PkarrPublisher::n0_dns(secret_key.clone());
     let mut keys = Vec::new();
     for entry in std::fs::read_dir(&data_path)? {
@@ -356,6 +377,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Sign(args) => sign(args).await?,
     }
     Ok(())
+}
+
+fn get_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
+    if path.exists() {
+        let key_bytes = std::fs::read(path)?;
+        Ok(SecretKey::try_from_openssh(key_bytes.as_slice())?)
+    } else {
+        let key = SecretKey::generate();
+        let key_bytes = key.to_openssh()?;
+        std::fs::write(path, &key_bytes)?;
+        Ok(key)
+    }
 }
 
 /// Example copied from the frost docs
