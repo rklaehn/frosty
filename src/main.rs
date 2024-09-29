@@ -1,6 +1,10 @@
 use anyhow::Context;
 use clap::Parser;
-use frost_ed25519::{self as frost, keys::{IdentifierList, SecretShare}, Ed25519ScalarField, Field, Identifier};
+use frost_ed25519::{
+    self as frost,
+    keys::{IdentifierList, SecretShare},
+    Ed25519ScalarField, Field, Identifier,
+};
 use iroh_net::key::PublicKey;
 use rand::thread_rng;
 use sha2::{Digest, Sha512};
@@ -15,14 +19,17 @@ struct Args {
 #[derive(Debug, clap::Parser)]
 enum Command {
     Split(SplitArgs),
-    Reconstruct(ReconstructArgs),
+    Sign(SignArgs),
 }
 
 #[derive(Debug, clap::Parser)]
 struct SplitArgs {
     /// nodes that are going to own the shares
     nodes: Vec<String>,
-    #[clap(long, help = "threshold for the secret sharing. Default is n-1. Must be less than the number of nodes, and greater than 1.")]
+    #[clap(
+        long,
+        help = "threshold for the secret sharing. Default is n-1. Must be less than the number of nodes, and greater than 1."
+    )]
     threshold: Option<u16>,
     /// Key to split
     #[clap(long)]
@@ -30,20 +37,20 @@ struct SplitArgs {
 }
 
 #[derive(Debug, clap::Parser)]
-struct ReconstructArgs {
+struct SignArgs {
     directories: Vec<String>,
-    #[clap(long)]
-    name: String,
     #[clap(long)]
     message: String,
     #[clap(long)]
-    key: Option<PublicKey>,
+    key: PublicKey,
 }
 
 fn split(args: SplitArgs) -> anyhow::Result<()> {
-    let identifiers = args.nodes.iter().map(|node| {
-        Identifier::derive(node.as_bytes()).context("unable to derive identifier")
-    }).collect::<anyhow::Result<Vec<_>>>()?;
+    let identifiers = args
+        .nodes
+        .iter()
+        .map(|node| Identifier::derive(node.as_bytes()).context("unable to derive identifier"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let max_signers: u16 = args.nodes.len().try_into().context("too many nodes")?;
     let min_signers = args.threshold.unwrap_or(max_signers - 1);
     let key = std::fs::read_to_string(&args.key)?;
@@ -51,7 +58,13 @@ fn split(args: SplitArgs) -> anyhow::Result<()> {
     let key_bytes = iroh_key.to_bytes();
     let scalar = ed25519_secret_key_to_scalar(&key_bytes);
     let key = frost::SigningKey::from_scalar(scalar);
-    let (parts, pubkey) = frost::keys::split(&key, max_signers, min_signers, IdentifierList::Custom(&identifiers), &mut thread_rng())?;
+    let (parts, pubkey) = frost::keys::split(
+        &key,
+        max_signers,
+        min_signers,
+        IdentifierList::Custom(&identifiers),
+        &mut thread_rng(),
+    )?;
     let pubkey_bytes = postcard::to_allocvec(&pubkey).context("unable to serialize pubkey")?;
     for (node, id) in args.nodes.iter().zip(identifiers.iter()) {
         let secret_share = parts.get(id).context("missing part")?;
@@ -66,11 +79,12 @@ fn split(args: SplitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reconstruct(args: ReconstructArgs) -> anyhow::Result<()> {
+fn sign(args: SignArgs) -> anyhow::Result<()> {
     let mut parts = Vec::new();
     let mut paths = Vec::new();
+    let key = args.key;
     for part in args.directories.iter() {
-        let secret_share_path = PathBuf::from(part).join(format!("{}.secret", args.name));
+        let secret_share_path = PathBuf::from(part).join(format!("{}.secret", key));
         let secret_share_bytes = std::fs::read(&secret_share_path)?;
         paths.push(secret_share_path);
         let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
@@ -79,13 +93,15 @@ fn reconstruct(args: ReconstructArgs) -> anyhow::Result<()> {
     }
     let secret = frost::keys::reconstruct(parts.as_slice())?;
     println!("Reconstructed a signing key from {:?}", paths);
-    let signature = secret.sign(rand::thread_rng(), args.message.as_bytes());
+    let msg = args.message.as_bytes();
+    let signature = secret.sign(rand::thread_rng(), msg);
     let signature_bytes = signature.serialize();
-    println!("Signature: {:?}", hex::encode(&signature_bytes));
-    if let Some(key) = args.key {
-        let iroh_signature: iroh_net::key::Signature = signature_bytes.into();
-        let res = key.verify(args.message.as_bytes(), &iroh_signature);
-        println!("Verification: {:?}", res);
+    println!("Signature: {}", hex::encode(&signature_bytes));
+    let iroh_signature: iroh_net::key::Signature = signature_bytes.into();
+    let res = key.verify(msg, &iroh_signature);
+    if res.is_err() {
+        println!("Verification failed: {:?}", res);
+        res?;
     }
     Ok(())
 }
@@ -103,21 +119,23 @@ fn ed25519_secret_key_to_scalar(secret_key: &[u8; 32]) -> <Ed25519ScalarField as
     // Step 3: Perform bitwise manipulations to ensure it's a valid scalar
     scalar_bytes[0] &= 248; // Clear the lowest 3 bits
     scalar_bytes[31] &= 127; // Clear the highest bit
-    scalar_bytes[31] |= 64;  // Set the second highest bit
+    scalar_bytes[31] |= 64; // Set the second highest bit
 
     // Step 4: Create the Scalar from the modified bytes
     <Ed25519ScalarField as Field>::Scalar::from_bytes_mod_order(scalar_bytes)
 }
- 
-fn main() -> anyhow::Result<()> {
 
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
         Command::Split(args) => split(args)?,
-        Command::Reconstruct(args) => reconstruct(args)?,
+        Command::Sign(args) => sign(args)?,
     }
-    return Ok(());
+    Ok(())
+}
 
+/// Example copied from the frost docs
+fn example() -> anyhow::Result<()> {
     let mut rng = thread_rng();
     let max_signers = 5;
     let min_signers = 3;
