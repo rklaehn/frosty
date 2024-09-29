@@ -174,7 +174,7 @@ fn example() -> anyhow::Result<()> {
         // Generate one (1) nonce and one SigningCommitments instance for each
         // participant, up to _threshold_.
         let (nonces, commitments) = frost::round1::commit(
-            key_packages[&participant_identifier].signing_share(),
+            key_package.signing_share(),
             &mut rng,
         );
         // In practice, the nonces must be kept by the participant to use in the
