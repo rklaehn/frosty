@@ -100,7 +100,7 @@ fn split(args: SplitArgs) -> anyhow::Result<()> {
         IdentifierList::Custom(&identifiers),
         &mut thread_rng(),
     )?;
-    let pubkey_bytes = postcard::to_allocvec(&pubkey).context("unable to serialize pubkey")?;
+    let pubkey_bytes = pubkey.serialize()?;
     for (node, id) in args.nodes.iter().zip(identifiers.iter()) {
         let secret_share = parts.get(id).context("missing part")?;
         let path: PathBuf = format!("{}", node).into();
@@ -344,7 +344,6 @@ async fn cosign_daemon(args: CosignArgs) -> anyhow::Result<()> {
         println!("Can cosign for following keys");
         for (key, key_package) in keys.iter() {
             println!("- {} (min {} signers)", key, key_package.min_signers());
-            println!("{:?}", key_package.identifier())
         }
     }
     let endpoint = iroh_net::endpoint::Endpoint::builder()
@@ -354,7 +353,7 @@ async fn cosign_daemon(args: CosignArgs) -> anyhow::Result<()> {
         .bind()
         .await?;
     let addr = endpoint.node_addr().await?;
-    println!("Listening on {}", addr.node_id);
+    println!("\nListening on {}", addr.node_id);
     while let Some(incoming) = endpoint.accept().await {
         let data_path = data_path.clone();
         tokio::task::spawn(async {
@@ -392,6 +391,7 @@ fn get_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
 }
 
 /// Example copied from the frost docs
+#[allow(dead_code)]
 fn example() -> anyhow::Result<()> {
     let mut rng = thread_rng();
     let max_signers = 5;
