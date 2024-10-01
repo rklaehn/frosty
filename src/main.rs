@@ -17,9 +17,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
-    time::Duration,
 };
-use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
 const COSIGN_ALPN: &[u8] = b"FROST_COSIGN";
@@ -105,7 +103,7 @@ fn split(args: SplitArgs) -> anyhow::Result<()> {
     let max_signers: u16 = args.nodes.len().try_into().context("too many nodes")?;
     let min_signers = args.threshold.unwrap_or(max_signers - 1);
     let key = std::fs::read_to_string(&args.key)?;
-    let iroh_key = iroh_net::key::SecretKey::try_from_openssh(&key)?;
+    let iroh_key = iroh_net::key::SecretKey::try_from_openssh(key)?;
     let key_bytes = iroh_key.to_bytes();
     let scalar = ed25519_secret_key_to_scalar(&key_bytes);
     let key = frost::SigningKey::from_scalar(scalar);
@@ -119,7 +117,7 @@ fn split(args: SplitArgs) -> anyhow::Result<()> {
     let pubkey_bytes = pubkey.serialize()?;
     for (node, id) in args.nodes.iter().zip(identifiers.iter()) {
         let secret_share = parts.get(id).context("missing part")?;
-        let path: PathBuf = format!("{}", node).into();
+        let path: PathBuf = node.to_string().into();
         std::fs::create_dir_all(&path)?;
         let pubkey_path = path.join(format!("{}.pub", iroh_key.public()));
         std::fs::write(pubkey_path, &pubkey_bytes)?;
@@ -188,7 +186,7 @@ fn sign_local(args: SignLocalArgs) -> anyhow::Result<()> {
     let msg = args.message.as_bytes();
     let signature = secret.sign(rand::thread_rng(), msg);
     let signature_bytes = signature.serialize();
-    println!("Signature: {}", hex::encode(&signature_bytes));
+    println!("Signature: {}", hex::encode(signature_bytes));
     let iroh_signature: iroh_net::key::Signature = signature_bytes.into();
     let res = key.verify(msg, &iroh_signature);
     if res.is_err() {
@@ -257,10 +255,10 @@ async fn handle_cosign_request(
     let signature_share_bytes = signature_share.serialize();
     tracing::info!("Sending signature share");
     send.write_all(&signature_share_bytes).await?;
-    send.shutdown().await?;
     info!("Finished handling cosign request");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    // futures::future::pending::<()>().await;
+    // wait for the connection to close.
+    // if we don't do this, we might lose the last message in transit
+    connection.closed().await;
     Ok(())
 }
 
@@ -323,7 +321,7 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     // for each cosigner, we get send and recv streams, identifier and commitments
     info!("Get commitment from {} cosigners", min_cosigners);
     let cosigners = futures::stream::iter(args.cosigners.iter())
-        .map(|cosigner| send_cosign_request_round1(&endpoint, &cosigner, &args.key))
+        .map(|cosigner| send_cosign_request_round1(&endpoint, cosigner, &args.key))
         .buffer_unordered(10)
         .filter_map(|res| async {
             res.inspect_err(|e| warn!("Error sending cosign request: {:?}", e))
@@ -334,7 +332,7 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
         .await;
     let mut commitments_map = BTreeMap::new();
     for (_, _, identifier, commitments) in cosigners.iter() {
-        commitments_map.insert(*identifier, commitments.clone());
+        commitments_map.insert(*identifier, *commitments);
     }
     let local_identifier = *key_package.identifier();
     commitments_map.insert(local_identifier, commitments);
@@ -361,7 +359,7 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     if let Err(cause) = key.verify(args.message.as_bytes(), &iroh_signature) {
         error!("Verification failed: {:?}", cause);
     }
-    println!("Signature: {}", hex::encode(&bytes));
+    println!("Signature: {}", hex::encode(bytes));
     Ok(())
 }
 
@@ -442,6 +440,7 @@ fn get_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
 
 /// Example copied from the frost docs
 #[allow(dead_code)]
+#[allow(clippy::unnecessary_cast)]
 fn example() -> anyhow::Result<()> {
     let mut rng = thread_rng();
     let max_signers = 5;
