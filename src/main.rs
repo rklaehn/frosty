@@ -1,4 +1,3 @@
-use anyhow::Context;
 use clap::Parser;
 use frost_ed25519::{
     self as frost,
@@ -15,9 +14,11 @@ use rand::thread_rng;
 use sha2::{Digest, Sha512};
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{error, info, warn};
 
 const COSIGN_ALPN: &[u8] = b"FROST_COSIGN";
@@ -39,16 +40,15 @@ enum Command {
 
 #[derive(Debug, clap::Parser)]
 struct SplitArgs {
-    /// nodes that are going to own the shares
-    nodes: Vec<String>,
-    #[clap(
-        long,
-        help = "threshold for the secret sharing. Default is n-1. Must be less than the number of nodes, and greater than 1."
-    )]
-    threshold: Option<u16>,
     /// Key to split
     #[clap(long)]
     key: PathBuf,
+    #[clap(long, default_value_t = 2, help = "Minimum number of signers")]
+    min_signers: u16,
+    #[clap(long, default_value_t = 3, help = "Maximum number of signers")]
+    max_signers: u16,
+    #[clap(long, help = "Directory to store the key shares")]
+    target: PathBuf,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -65,11 +65,11 @@ struct ReSplitArgs {
     directories: Vec<String>,
     #[clap(long)]
     key: PublicKey,
-    #[clap(long, default_value_t = 2)]
+    #[clap(long, default_value_t = 2, help = "Minimum number of signers")]
     min_signers: u16,
-    #[clap(long, default_value_t = 3)]
+    #[clap(long, default_value_t = 3, help = "Maximum number of signers")]
     max_signers: u16,
-    #[clap(long)]
+    #[clap(long, help = "Directory to store the key shares")]
     target: PathBuf,
 }
 
@@ -95,35 +95,39 @@ struct CosignArgs {
 }
 
 fn split(args: SplitArgs) -> anyhow::Result<()> {
-    let identifiers = args
-        .nodes
-        .iter()
-        .map(|node| Identifier::derive(node.as_bytes()).context("unable to derive identifier"))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let max_signers: u16 = args.nodes.len().try_into().context("too many nodes")?;
-    let min_signers = args.threshold.unwrap_or(max_signers - 1);
-    let key = std::fs::read_to_string(&args.key)?;
+    if args.max_signers < args.min_signers {
+        anyhow::bail!("max-signers must be greater than or equal to min-signers");
+    }
+    let max_signers = args.max_signers;
+    let min_signers = args.min_signers;
+    let key = fs::read_to_string(&args.key)?;
     let iroh_key = iroh_net::key::SecretKey::try_from_openssh(key)?;
     let key_bytes = iroh_key.to_bytes();
     let scalar = ed25519_secret_key_to_scalar(&key_bytes);
     let key = frost::SigningKey::from_scalar(scalar);
+    println!(
+        "Splitting key {} into {} parts",
+        iroh_key.public(),
+        max_signers
+    );
     let (parts, pubkey) = frost::keys::split(
         &key,
         max_signers,
         min_signers,
-        IdentifierList::Custom(&identifiers),
+        IdentifierList::Default,
         &mut thread_rng(),
     )?;
     let pubkey_bytes = pubkey.serialize()?;
-    for (node, id) in args.nodes.iter().zip(identifiers.iter()) {
-        let secret_share = parts.get(id).context("missing part")?;
-        let path: PathBuf = node.to_string().into();
-        std::fs::create_dir_all(&path)?;
+    for (i, secret_share) in parts.values().enumerate() {
+        let n = i + 1;
+        let path: PathBuf = args.target.join(n.to_string());
+        println!("Storing part {} in directory {}", n, path.display());
+        fs::create_dir_all(&path)?;
         let pubkey_path = path.join(format!("{}.pub", iroh_key.public()));
-        std::fs::write(pubkey_path, &pubkey_bytes)?;
+        fs::write(pubkey_path, &pubkey_bytes)?;
         let key_path = path.join(format!("{}.secret", iroh_key.public()));
         let secret_share_bytes = secret_share.serialize()?;
-        std::fs::write(key_path, secret_share_bytes)?;
+        fs::write(key_path, secret_share_bytes)?;
     }
     Ok(())
 }
@@ -132,15 +136,19 @@ fn resplit(args: ReSplitArgs) -> anyhow::Result<()> {
     if args.directories.len() < 2 {
         anyhow::bail!("At least two directories are required");
     }
+    if args.max_signers < args.min_signers {
+        anyhow::bail!("max-signers must be greater than or equal to min-signers");
+    }
+    println!("Reconstructing key from {:?}", args.directories);
     let mut parts = Vec::new();
     let key = args.key;
     for part in args.directories.iter() {
         let secret_share_path = PathBuf::from(part).join(format!("{}.secret", key));
-        let secret_share_bytes = std::fs::read(&secret_share_path)?;
+        let secret_share_bytes = fs::read(&secret_share_path)?;
         let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
         let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
         let public_key_package_path = PathBuf::from(part).join(format!("{}.pub", key));
-        let public_key_package_bytes = std::fs::read(&public_key_package_path)?;
+        let public_key_package_bytes = fs::read(&public_key_package_path)?;
         let public_key_package = PublicKeyPackage::deserialize(&public_key_package_bytes)?;
         parts.push((key_package, public_key_package));
     }
@@ -157,14 +165,17 @@ fn resplit(args: ReSplitArgs) -> anyhow::Result<()> {
         &mut thread_rng(),
     )?;
     let public_key_package_bytes = pubkey.serialize()?;
+    println!("Re-splitting key into {} parts", args.max_signers);
     for (i, (_, secret_share)) in parts.iter().enumerate() {
+        let n = i + 1;
         let secret_share_bytes = secret_share.serialize()?;
-        let dir = args.target.join(format!("{}", i));
-        std::fs::create_dir_all(&dir)?;
+        let dir = args.target.join(format!("{}", n));
+        println!("Storing part {} in directory {}", n, dir.display());
+        fs::create_dir_all(&dir)?;
         let secret_share_path = dir.join(format!("{}.secret", args.key));
-        std::fs::write(secret_share_path, secret_share_bytes)?;
+        fs::write(secret_share_path, secret_share_bytes)?;
         let public_key_package_path = dir.join(format!("{}.pub", args.key));
-        std::fs::write(public_key_package_path, public_key_package_bytes.clone())?;
+        fs::write(public_key_package_path, public_key_package_bytes.clone())?;
     }
     Ok(())
 }
@@ -175,7 +186,7 @@ fn sign_local(args: SignLocalArgs) -> anyhow::Result<()> {
     let key = args.key;
     for part in args.directories.iter() {
         let secret_share_path = PathBuf::from(part).join(format!("{}.secret", key));
-        let secret_share_bytes = std::fs::read(&secret_share_path)?;
+        let secret_share_bytes = fs::read(&secret_share_path)?;
         paths.push(secret_share_path);
         let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
         let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
@@ -224,40 +235,31 @@ async fn handle_cosign_request(
     let remote_node_id = iroh_net::endpoint::get_remote_node_id(&connection)?;
     info!("Incoming connection from {}", remote_node_id,);
     let (mut send, mut recv) = connection.accept_bi().await?;
-    let mut key = [0u8; 32];
-    recv.read_exact(&mut key).await?;
-    let key = PublicKey::from_bytes(&key)?;
+    let key_bytes = read_exact_bytes(&mut recv).await?;
+    let key = PublicKey::from_bytes(&key_bytes)?;
     info!("Received request to co-sign for key {}", key);
     let secret_share_path = data_path.join(format!("{}.secret", key));
-    let secret_share_bytes = std::fs::read(&secret_share_path)?;
+    let secret_share_bytes = tokio::fs::read(&secret_share_path).await?;
     let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
     let key_package = KeyPackage::try_from(secret_share)?;
     info!("Got fragment, creating commitment");
     let (nonces, commitments) =
         frost::round1::commit(key_package.signing_share(), &mut thread_rng());
-    let identifier_bytes = key_package.identifier().serialize();
     info!("Sending identifier");
-    send.write_all(&identifier_bytes).await?;
-    let commitments_bytes = commitments.serialize()?;
-    let commitments_bytes_len = commitments_bytes.len() as u32;
+    send.write_all(&key_package.identifier().serialize())
+        .await?;
     info!("Sending commitment");
-    send.write_all(&commitments_bytes_len.to_be_bytes()).await?;
-    send.write_all(&commitments_bytes).await?;
+    write_lp(&mut send, &commitments.serialize()?).await?;
     info!("Waiting for signing package");
-    let mut signing_package_len_bytes = [0u8; 4];
-    recv.read_exact(&mut signing_package_len_bytes).await?;
-    let mut signing_package_bytes =
-        vec![0u8; u32::from_be_bytes(signing_package_len_bytes) as usize];
-    recv.read_exact(&mut signing_package_bytes).await?;
-    let signing_package = SigningPackage::deserialize(&signing_package_bytes)?;
+    let signing_package = SigningPackage::deserialize(&read_lp(&mut recv).await?)?;
     info!("Received signing package, creating signature share");
     let signature_share = frost::round2::sign(&signing_package, &nonces, &key_package)?;
-    let signature_share_bytes = signature_share.serialize();
-    tracing::info!("Sending signature share");
-    send.write_all(&signature_share_bytes).await?;
+    info!("Sending signature share");
+    send.write_all(&signature_share.serialize()).await?;
     info!("Finished handling cosign request");
     // wait for the connection to close.
     // if we don't do this, we might lose the last message in transit
+    // See https://www.iroh.computer/blog/closing-a-quic-connection for details
     connection.closed().await;
     Ok(())
 }
@@ -274,18 +276,13 @@ async fn send_cosign_request_round1(
 )> {
     let connection = endpoint.connect((*cosigner).into(), COSIGN_ALPN).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    tracing::info!("Sending cosign request for key {} to {}", key, cosigner);
+    info!("Sending cosign request for key {} to {}", key, cosigner);
     send.write_all(key.as_bytes()).await?;
-    let mut identifier_bytes = [0u8; 32];
-    recv.read_exact(&mut identifier_bytes).await?;
+    let identifier_bytes = read_exact_bytes(&mut recv).await?;
     let identifier = Identifier::deserialize(&identifier_bytes)?;
-    let mut commitments_len_bytes = [0u8; 4];
-    recv.read_exact(&mut commitments_len_bytes).await?;
-    let commitments_len = u32::from_be_bytes(commitments_len_bytes) as usize;
-    let mut commitments_bytes = vec![0u8; commitments_len];
-    recv.read_exact(&mut commitments_bytes).await?;
+    let commitments_bytes = read_lp(&mut recv).await?;
     let commitments = frost::round1::SigningCommitments::deserialize(&commitments_bytes)?;
-    tracing::info!("Received commitments");
+    info!("Received commitments");
     Ok((send, recv, identifier, commitments))
 }
 
@@ -295,16 +292,21 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     let key = args.key;
     let secret_share_path = data_path.join(format!("{}.secret", key));
     info!("Reading secret share from {}", secret_share_path.display());
-    let secret_share_bytes = std::fs::read(&secret_share_path)?;
+    let secret_share_bytes = fs::read(&secret_share_path)?;
     let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
-    let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
+    let key_package = KeyPackage::try_from(secret_share)?;
+    if args.cosigners.len() + 1 < (*key_package.min_signers() as usize) {
+        anyhow::bail!(
+            "At least {} cosigners are required",
+            key_package.min_signers() - 1
+        );
+    }
     let public_key_package_path = data_path.join(format!("{}.pub", key));
     info!(
         "Reading public key package from {}",
-        secret_share_path.display()
+        public_key_package_path.display()
     );
-    let public_key_package_bytes = std::fs::read(&public_key_package_path)?;
-    let public_key_package = PublicKeyPackage::deserialize(&public_key_package_bytes)?;
+    let public_key_package = PublicKeyPackage::deserialize(&fs::read(&public_key_package_path)?)?;
     info!("Creating local commitment");
     let (nonce, commitments) =
         frost::round1::commit(key_package.signing_share(), &mut thread_rng());
@@ -338,17 +340,13 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     commitments_map.insert(local_identifier, commitments);
     let signing_package = frost::SigningPackage::new(commitments_map, args.message.as_bytes());
     let signing_package_bytes = signing_package.serialize()?;
-    let signing_package_bytes_len = signing_package_bytes.len() as u32;
     let mut signature_shares = BTreeMap::new();
     info!("Creating local signature share");
     let local_signature_share = frost::round2::sign(&signing_package, &nonce, &key_package)?;
     signature_shares.insert(local_identifier, local_signature_share);
     for (mut send, mut recv, identifier, _) in cosigners {
-        send.write_all(&signing_package_bytes_len.to_be_bytes())
-            .await?;
-        send.write_all(&signing_package_bytes).await?;
-        let mut signature_share_bytes = [0u8; 32];
-        recv.read_exact(&mut signature_share_bytes).await?;
+        write_lp(&mut send, &signing_package_bytes).await?;
+        let signature_share_bytes = read_exact_bytes(&mut recv).await?;
         let signature_share = frost::round2::SignatureShare::deserialize(signature_share_bytes)?;
         signature_shares.insert(identifier, signature_share);
     }
@@ -367,7 +365,7 @@ async fn cosign_daemon(args: CosignArgs) -> anyhow::Result<()> {
     let data_path = args.data_path.unwrap_or_else(|| PathBuf::from("."));
     let secret_key = get_or_create_key(&data_path.join("keypair"))?;
     let mut keys = Vec::new();
-    for entry in std::fs::read_dir(&data_path)? {
+    for entry in fs::read_dir(&data_path)? {
         let entry = entry?;
         let path = entry.path();
         if path
@@ -378,7 +376,7 @@ async fn cosign_daemon(args: CosignArgs) -> anyhow::Result<()> {
             if let Some(stem) = path.file_stem() {
                 if let Some(text) = stem.to_str() {
                     let key = iroh_net::key::PublicKey::from_str(text)?;
-                    let secret_share_bytes = std::fs::read(&path)?;
+                    let secret_share_bytes = fs::read(&path)?;
                     let secret_share = SecretShare::deserialize(&secret_share_bytes)?;
                     let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
                     keys.push((key, key_package));
@@ -436,6 +434,30 @@ fn get_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
         std::fs::write(path, &key_bytes)?;
         Ok(key)
     }
+}
+
+async fn read_exact_bytes<R: AsyncReadExt + Unpin, const N: usize>(
+    reader: &mut R,
+) -> anyhow::Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn write_lp<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> anyhow::Result<()> {
+    let len = data.len() as u32;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(data).await?;
+    Ok(())
+}
+
+async fn read_lp<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<Vec<u8>> {
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).await?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    let mut data = vec![0u8; len];
+    reader.read_exact(&mut data).await?;
+    Ok(data)
 }
 
 /// Example copied from the frost docs
