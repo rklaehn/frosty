@@ -7,7 +7,7 @@ use frost_ed25519::{
 use futures::StreamExt;
 use iroh_net::{
     discovery::{dns::DnsDiscovery, pkarr::PkarrPublisher},
-    endpoint::{RecvStream, SendStream},
+    endpoint::{RecvStream, SendStream, VarInt},
     key::{PublicKey, SecretKey},
 };
 use rand::thread_rng;
@@ -353,11 +353,12 @@ async fn sign(args: SignArgs) -> anyhow::Result<()> {
     info!("got {} signature shares", signature_shares.len());
     let signature = frost::aggregate(&signing_package, &signature_shares, &public_key_package)?;
     let bytes = signature.serialize();
-    let iroh_signature: iroh_net::key::Signature = bytes.into();
+    let iroh_signature = iroh_net::key::Signature::from(bytes);
     if let Err(cause) = key.verify(args.message.as_bytes(), &iroh_signature) {
         error!("Verification failed: {:?}", cause);
     }
     println!("Signature: {}", hex::encode(bytes));
+    endpoint.close(0u8.into(), b"done").await?;
     Ok(())
 }
 
